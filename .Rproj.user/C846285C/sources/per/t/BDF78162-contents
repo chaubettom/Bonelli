@@ -37,6 +37,7 @@ library(recurse)
 load(here("Data","list_propre_individu_jour.Rdata"))
 load(here("Data","list_segmentation_xy.Rdata"))
 data_survival <- read_excel(here("Data","data_survival.xlsx"))
+
 ```
 
 ## Préparation des données
@@ -101,8 +102,6 @@ On a une liste avec un dataframe avec les trajectoires des individus et des metr
 
 D'abord j'enleve les individus non parti en erratisme, je ne garde que les colonne x,y, dist (distance journalière), dist_nest (distance au nid), et je stocke dans une liste : list_bonelli_errat
 
-Puis
-
 ```{r}
 list_bonelli_errat<-list()
 for(ind in names(list_ltraj_bonelli)){
@@ -134,6 +133,8 @@ for(ind_traj in list_bonelli_errat){
  }
 }
 ```
+
+### Liste metrique par individu
 
 L'individu suivi le plus longtemps pendant erratisme est BA11496 avec 67 mois. Il faut mentionner que la date de fin de suivi est maximum le 20/03/2023. On va donc faire des tableaux avec 67 ligne (une par mois).
 
@@ -183,9 +184,190 @@ for(ind_traj in list_bonelli_errat){
     ungroup()
   list_metric_errat[[unique(ind_traj$ID)]]<-errat_metric_ind
 }
-list_metric_errat$BA11476
+
 ```
 
 Il faudra gérer le fait que certain mois n'ont quasiment aucune données.
 
+### Classes de distances
+
 Maintenant on fait des classes pour chaques métriques.
+
+```{r}
+library(dplyr)
+
+# Fusionner toutes les données de la population en un seul dataframe
+combined_data <- bind_rows(list_metric_errat, .id = "ID")
+
+# Appliquer ntile pour diviser en 3 groupes égaux pour chaque métrique
+temporary_combined_data <- combined_data %>%filter(prop_day_tracked>=0.2)%>%
+  mutate(
+    # Classification pour dnest_max_life en 3 quantiles égaux
+    dnest_max_life_class = ntile(dnest_max_life, 3),
+    
+    # Classification pour dnest_mean_life en 3 quantiles égaux
+    dnest_mean_life_class = ntile(dnest_mean_life, 3),
+    
+    # Classification pour dnest_mean_month en 3 quantiles égaux
+    dnest_mean_month_class = ntile(dnest_mean_month, 3),
+    
+    # Classification pour dist_mean_life en 3 quantiles égaux
+    dist_mean_life_class = ntile(dist_mean_life, 3),
+    
+    # Classification pour dist_cum_life en 3 quantiles égaux
+    dist_cum_life_class = ntile(dist_cum_life, 3),
+    
+    # Classification pour dist_cum_month en 3 quantiles égaux
+    dist_cum_month_class = ntile(dist_cum_month, 3)
+  )
+data_metric_all_ind<-left_join(combined_data,temporary_combined_data)%>%
+#On ajoute une classe 0 quand on a moins de 20% de jours suivis dans un mois
+  mutate(dnest_max_life_class=case_when(prop_day_tracked<0.2~5,
+                                        TRUE~dnest_max_life_class),
+         dnest_mean_life_class=case_when(prop_day_tracked<0.2~5,
+                                        TRUE~dnest_mean_life_class),
+         dnest_mean_month_class=case_when(prop_day_tracked<0.2~5,
+                                        TRUE~dnest_mean_month_class),
+         dist_mean_life_class=case_when(prop_day_tracked<0.2~5,
+                                        TRUE~dist_mean_life_class),
+         dist_cum_life_class=case_when(prop_day_tracked<0.2~5,
+                                        TRUE~dist_cum_life_class),
+         dist_cum_month_class=case_when(prop_day_tracked<0.2~5,
+                                        TRUE~dist_cum_month_class))
+    
+    
+    
+    
+    # Affichage du résultat pour un individu (par exemple BA11496)
+View(data_metric_all_ind)
+```
+
+On visualise la répartition des métriques en fonction du temps
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Créer un dataframe long avec les classes de chaque métrique
+data_long <- combined_data %>%
+  gather(key = "metric", value = "class", 
+         dnest_max_life_class, 
+         dnest_mean_life_class, 
+         dnest_mean_month_class, 
+         dist_mean_life_class, 
+         dist_cum_life_class, 
+         dist_cum_month_class) %>%
+  group_by(month, metric, class) %>%
+  summarise(count = n(), .groups = "drop")
+
+# Créer un graphique pour chaque métrique
+# Liste des graphiques pour chaque métrique
+metrics <- c("dnest_max_life_class", "dnest_mean_life_class", 
+             "dnest_mean_month_class", "dist_mean_life_class", 
+             "dist_cum_life_class", "dist_cum_month_class")
+
+# Boucle pour créer les graphiques
+for (metric_errat in metrics) {
+  p <- ggplot(data_long %>% filter(metric == metric_errat), aes(x = month, y = count, color = as.factor(class))) +
+    geom_line(size=1.2)+
+    #geom_bar(stat = "identity", position = "dodge") +
+    labs(x = "Mois", y = "Nombre d'individus", color = "Classe", title = paste("Distribution des classes pour", metric_errat)) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  
+  print(p)
+}
+
+```
+
+Maintenant on regarde les histoires de vie de chaque individu
+
+```{r}
+library(ggplot2)
+
+# Liste des métriques
+metrics <- c("dnest_max_life_class", "dnest_mean_life_class", 
+             "dnest_mean_month_class", "dist_mean_life_class", 
+             "dist_cum_life_class", "dist_cum_month_class")
+
+# Boucle pour créer les graphiques
+for (metric in metrics) {
+  p <- ggplot(combined_data, aes(x = month, y = !!sym(metric), group = ID, color = as.factor(!!sym(metric)))) +
+    geom_line() + 
+    labs(x = "Mois", y = "Classe", 
+         title = paste("Évolution des classes pour", metric), 
+         color = "Classe") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    scale_color_manual(values = c("0" = "gray", "1" = "blue", "2" = "green", "3" = "red")) # Personnaliser les couleurs si nécessaire
+  
+  print(p)
+}
+
+```
+
+## Tableau CMR
+
+On fait 6 états :
+
+**0:** non observé (suivi fini)
+
+**1:** classe distance 1
+
+**2:** classe distance 2
+
+**3:** classe distance 3
+
+**4:** observé mort, puis mort mois suivant
+
+**5:** observé mais classe distance inconnue
+
+**6:** trash après date fin de suivi ou après cantonnement
+
+Voici une fonction qui fait le tableau de CMR pour une metrique en input
+
+```{r}
+generate_CMR_table<-function(metric_name){
+  full_data_table<-data_survival%>%select(ID=Individu,Sexe,Date_debut,Date_fin,Mort,Cantonnement,Controle=Contrôle)%>%merge(data_metric_all_ind)
+  full_data_table$Controle>as.Date("20-03-2021", format = "%d-%m-%Y")
+  full_data_table$Mort=="Oui"&full_data_table$debut_periode>=full_data_table$Date_fin
+  full_data_table<-full_data_table%>%
+    mutate(state=case_when(Mort=="Oui"&debut_periode>=Date_fin~4,
+                           Mort=="Oui"&
+                             debut_periode<Date_fin~get(metric_name),
+                           Mort=="NA"&debut_periode>=Date_fin~0,
+                           Mort=="NA"&
+                             debut_periode<Date_fin~get(metric_name),
+                           Mort=="Non"&
+                             debut_periode<Date_fin~get(metric_name),
+                           Mort=="Non"&debut_periode>=Date_fin&
+                             debut_periode<Cantonnement~5,
+                           Mort=="Non"&debut_periode>=Date_fin&
+                             debut_periode>=Cantonnement~6,
+                           Mort=="Non"&debut_periode>=Date_fin&
+                             debut_periode<Controle~5,
+                           Mort=="Non"&debut_periode>=Date_fin&
+                             debut_periode>=Controle~0,
+                           TRUE~10))%>%
+    mutate(state=case_when(debut_periode>=as.Date("20-03-2023", format = "%d-%m-%Y")~6,TRUE~state))
+  return(full_data_table)
+}
+table<-generate_CMR_table("dnest_max_life_class")
+
+for(ind in unique(table$ID)){
+  p<-table%>%
+    filter(ID==ind)%>%
+    ggplot(aes(x=month,y=state))+geom_line()+
+    scale_y_continuous(breaks = c(0, 1, 2, 3, 4, 5, 6), 
+                         labels = c("unseen", "dist1", "dist2", "dist3", "mort", "vivant unseen", "cantonné ou date limite")) +
+    labs(title = ind)
+  
+  print(p)
+}
+
+table_CMR<-table%>%select(ID,Sexe,month,state)%>%arrange(by=month)%>%
+  mutate(month = as.integer(month))%>%# S'assurer que 'month' est un entier
+  pivot_wider(names_from = month, values_from = state, names_prefix = "month_") %>%
+  arrange(ID) 
+```
