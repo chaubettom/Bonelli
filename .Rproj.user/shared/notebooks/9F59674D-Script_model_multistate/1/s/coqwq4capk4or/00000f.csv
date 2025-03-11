@@ -1,0 +1,24 @@
+"0","for(ind_traj in list_bonelli_errat){
+ max_date=ind_traj$date%>%as.Date()%>%max
+ depart_date=ind_traj$Date_depart_weston%>%
+   as.Date%>%unique
+ nbre_month_tracked=ceiling(as.numeric(difftime(max_date,depart_date))/30)
+ if(max_date>=as.Date(""20/03/2023"", format=""%d/%m/%Y"")){
+   print(""attention"")
+ }
+ if(nbre_month_tracked>=max_month_tracked){
+   max_month_tracked<-nbre_month_tracked
+   print(unique(ind_traj$ID))
+  print(nbre_month_tracked)
+
+ }
+}
+"
+"1","[1]"
+"1"," ""BA11496"""
+"1","
+"
+"1","[1]"
+"1"," 67"
+"1","
+"

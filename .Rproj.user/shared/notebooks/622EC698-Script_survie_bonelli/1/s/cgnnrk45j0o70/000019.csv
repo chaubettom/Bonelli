@@ -1,0 +1,6 @@
+"0","data_survival <- read_excel(here(""Data"",""data_survival.xlsx""))
+"
+"2","Erreur : symbole inattendu dans :
+""
+data_survival""
+"

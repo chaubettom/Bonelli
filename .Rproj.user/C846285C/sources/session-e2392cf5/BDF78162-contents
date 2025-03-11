@@ -1,0 +1,191 @@
+---
+title: "Script_multi_state"
+format: html
+editor: visual
+---
+
+## Importation des données et packages
+
+```{r}
+library(survival)
+library(survminer)
+library(knitr) 
+library(rmarkdown) 
+library(markdown)
+library(arulesViz)
+library(devtools)
+library(adehabitatHR)
+library(adehabitatHS)
+library(adehabitatMA)
+library(adehabitatLT)
+library(ggplot2)
+library(maptools)
+library(readxl)
+library(sf)
+library(spatstat)
+library(tidyverse)
+library(mapview)
+library(amt)
+library(dplyr)
+library(plyr)
+library(plotly)
+library(DHARMa)
+library(ggspatial)
+library(htmltools)
+library(htmlwidgets)
+library(recurse)
+load(here("Data","list_propre_individu_jour.Rdata"))
+load(here("Data","list_segmentation_xy.Rdata"))
+data_survival <- read_excel(here("Data","data_survival.xlsx"))
+```
+
+## Préparation des données
+
+### Dispersal onset
+
+On fait une liste qui contient les trajectoires, ainsi que les distances par jour, R2n la distance au nid au carrée, etc ...
+
+```{r}
+list_ltraj_bonelli<-list()
+for(i in 1:length(list_GPS_jour)){
+  ind=names(list_GPS_jour)[i]
+  list_GPS_jour[[ind]]%>%select(x,y,dater)%>%
+    st_as_sf(coords=c("x","y"),crs=4326)%>%st_transform(crs=2154)->sf_ind
+  ltraj=st_coordinates(sf_ind)%>%as.data.frame()%>%
+    mutate(dater=as.POSIXct(sf_ind$dater),id=ind)%>%
+    as.ltraj(date = .$dater,id = 'id',typeII = T)
+  list_ltraj_bonelli[[ind]]<-ltraj[[1]]%>%mutate(dist_nest=sqrt(R2n),day_interval=dt/86400)
+}
+
+```
+
+Ici on détermine les dates de départ en erratisme en utilisant la méthode de Weston et al. (2013).
+
+```{r}
+for(j in 1:length(list_ltraj_bonelli)){
+  ind<-names(list_ltraj_bonelli)[j]
+  print(ind)
+  #for each individual we calculate the distances between the nest (first location) and all the locations.
+  sf_data_ind<-list_ltraj_bonelli[[ind]] %>%  
+    st_as_sf(coords = c("x","y"),crs=2154) 
+  sf_data_ind$dist_from_nest<-
+    st_distance(sf_data_ind[1,],sf_data_ind) %>% 
+    as.vector()
+  #for eahc individuals we take the first date fulfilling the criterion.
+  duration_tracking<-nrow(sf_data_ind)
+  i=0
+  date_depart_weston<-NA
+  while((all(sf_data_ind[i:(i+10),]$dist_from_nest>5000)!=TRUE)&((i+10)<duration_tracking)){
+    date_depart_weston<-sf_data_ind[i,]$date
+    i=i+1
+  }
+  if((i+10)==duration_tracking){
+    date_depart_weston<-NA
+  }
+  list_ltraj_bonelli[[ind]]$Date_depart_weston<-date_depart_weston
+  list_ltraj_bonelli[[ind]]$duration_errat<-max(list_ltraj_bonelli[[ind]]$date)-list_ltraj_bonelli[[ind]]$Date_depart_weston
+}
+```
+
+On vérifie la cohérence des dates de départ. Crée un graphe par individu avec la date de départ en rouge.
+
+```{r}
+for(i in 1:length(list_ltraj_bonelli)){
+  print(list_ltraj_bonelli[[i]]%>%ggplot(aes(x=date,y=sqrt(R2n)/1000))+geom_line()+geom_vline(aes(xintercept = Date_depart_weston),color='red'))+scale_y_continuous(name = "Distance au nid (km)")
+}
+```
+
+On a une liste avec un dataframe avec les trajectoires des individus et des metriques de deplacement (dist nid, rel angle, etc ...). Maintenant on fait un nouveau dataframe avec les métriques de deplacement pour chaque individus
+
+## Calcul metrique
+
+D'abord j'enleve les individus non parti en erratisme, je ne garde que les colonne x,y, dist (distance journalière), dist_nest (distance au nid), et je stocke dans une liste : list_bonelli_errat
+
+Puis
+
+```{r}
+list_bonelli_errat<-list()
+for(ind in names(list_ltraj_bonelli)){
+  if(unique(!is.na(list_ltraj_bonelli[[ind]]$Date_depart_weston))){
+    list_bonelli_errat[[ind]]<-list_ltraj_bonelli[[ind]]%>%
+      mutate(ID=ind)%>%
+      select(ID,date,x,y,dist,dist_nest,Date_depart_weston)
+      
+  }
+}
+```
+
+Maintenant je cree une nouvelle liste list_metric_multistate, avec une colonne month correspondant à des périodes d'un mois (30 jours ici). Des colonnes debut periode et fin periode. Prop_day_tracked = nombre de jour suivi pendant le mois. dnest_max_life = distance maximum nid sur la vie, dnest_mean_life= distance nid moyenne sur la vie, dnest_mean_month=distance nid moyenne mois, dist_mean_life= distance moyenne sur la vie, dist_cum_life = distance cumulé sur la vie, dist_cum_month= distance cumulée sur le mois.
+
+La première chose à identifier est l'individu avec la durée maximal de suivi en mois.
+
+```{r}
+max_month_tracked=0
+for(ind_traj in list_bonelli_errat){
+ max_date=ind_traj$date%>%as.Date()%>%max
+ depart_date=ind_traj$Date_depart_weston%>%
+   as.Date%>%unique
+ nbre_month_tracked=ceiling(as.numeric(difftime(max_date,depart_date))/30)
+ if(nbre_month_tracked>=max_month_tracked){
+   max_month_tracked<-nbre_month_tracked
+   print(unique(ind_traj$ID))
+  print(nbre_month_tracked)
+
+ }
+}
+```
+
+L'individu suivi le plus longtemps pendant erratisme est BA11496 avec 67 mois. Il faut mentionner que la date de fin de suivi est maximum le 20/03/2023. On va donc faire des tableaux avec 67 ligne (une par mois).
+
+```{r}
+list_metric_errat<-list()
+for(ind_traj in list_bonelli_errat){
+  ind_traj<-ind_traj%>%filter(date>=Date_depart_weston)
+  errat_metric_ind<-data.frame(month=1:67)
+  Date_depart_errat=unique(ind_traj$Date_depart_weston)
+  Fin_suivi<-max(ind_traj$date)
+  #J'ajoute les dates de debut et fin periode
+  errat_metric_ind<-errat_metric_ind%>%mutate(ID=unique(ind_traj$ID),
+                                              debut_periode=Date_depart_errat+(month-1)*days(30),
+                                              fin_periode=Date_depart_errat+month*days(30))
+  
+  #J'ajoute la proportion de jours suivi pour chaque mois
+  prop_day_tracked <- errat_metric_ind %>%
+    rowwise() %>%
+    mutate(nb_localisations = sum(ind_traj$date >= debut_periode & ind_traj$date < fin_periode)) %>%
+    ungroup()
+  errat_metric_ind$prop_day_tracked<-prop_day_tracked$nb_localisations/30
+  
+  #J'ajoute dnest_max_life
+  errat_metric_ind <- errat_metric_ind %>%
+    rowwise() %>%
+    mutate(
+      #J'ajoute dnest_max_life
+      dnest_max_life = max(ind_traj$dist_nest[ind_traj$date < fin_periode], na.rm = TRUE),
+      
+      # Moyenne de dist_nest strictement avant la date de fin de période
+      dnest_mean_life = mean(ind_traj$dist_nest[ind_traj$date < fin_periode], na.rm = TRUE),
+      
+      # Moyenne de dist_nest pendant le mois (entre debut_periode inclus et fin_periode inclus)
+      dnest_mean_month = mean(ind_traj$dist_nest[ind_traj$date >= debut_periode & ind_traj$date < fin_periode], na.rm = TRUE),
+      
+      # Moyenne de dist strictement avant la date de fin de période
+      dist_mean_life = mean(ind_traj$dist[ind_traj$date < fin_periode], 
+                            na.rm = TRUE),
+      
+      # Somme des distances parcourues strictement avant fin_periode
+      dist_cum_life = sum(ind_traj$dist[ind_traj$date < fin_periode], 
+                          na.rm = TRUE),
+      
+      # Somme des distances parcourues pendant le mois (strictement entre debut_periode et fin_periode)
+      dist_cum_month = sum(ind_traj$dist[ind_traj$date >= debut_periode & ind_traj$date < fin_periode], na.rm = TRUE)
+    ) %>%
+    ungroup()
+  list_metric_errat[[unique(ind_traj$ID)]]<-errat_metric_ind
+}
+list_metric_errat$BA11476
+```
+
+Il faudra gérer le fait que certain mois n'ont quasiment aucune données.
+
+Maintenant on fait des classes pour chaques métriques.

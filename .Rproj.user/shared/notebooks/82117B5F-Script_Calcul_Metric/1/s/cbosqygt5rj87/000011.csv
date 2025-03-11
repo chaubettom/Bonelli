@@ -1,0 +1,5 @@
+"0","data_survival <- read.csv2(here(""Data"",""data_survival.csv""))
+"
+"2","Erreur dans make.names(col.names, unique = TRUE) : 
+  chaîne de charactères multioctets incorrecte 19
+"

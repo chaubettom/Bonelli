@@ -1,0 +1,4 @@
+"0","metric_ind%>%merge(data_survival)%>%"
+"0","  mutate(status=case_when(Mort==""Oui""~2,Mort==""Non""~1,is.na(Mort)~1),Date_depart=as.Date(Date_depart),Date_debut=as.Date(Date_debut,format=""%d/%m/%Y""),"
+"0","         Date_fin=as.Date(Date_fin,format=""%d/%m/%Y""))%>%mutate(time=as.numeric(Date_fin-Date_depart))->data_cox"
+"0",""

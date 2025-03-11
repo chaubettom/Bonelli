@@ -1,0 +1,197 @@
+---
+title: "Bonelli Calcul métrique"
+format: html
+editor: visual
+---
+
+## Importation des données
+
+```{r}
+library(survival)
+library(survminer)
+library(knitr) 
+library(rmarkdown) 
+library(markdown)
+library(arulesViz)
+library(devtools)
+library(adehabitatHR)
+library(adehabitatHS)
+library(adehabitatMA)
+library(adehabitatLT)
+library(ggplot2)
+library(maptools)
+library(readxl)
+library(sf)
+library(spatstat)
+library(tidyverse)
+library(mapview)
+library(amt)
+library(dplyr)
+library(plyr)
+library(plotly)
+library(DHARMa)
+library(ggspatial)
+library(htmltools)
+library(htmlwidgets)
+library(recurse)
+library(here)
+load(here("Data","list_propre_individu_jour.Rdata"))
+load(here("Data","list_segmentation_xy.Rdata"))
+data_survival <- read_excel(here("Data","data_survival.xlsx"))
+```
+
+## Préparation des données
+
+### Dispersal onset
+
+```{r}
+list_ltraj_bonelli<-list()
+for(i in 1:length(list_GPS_jour)){
+  ind=names(list_GPS_jour)[i]
+  list_GPS_jour[[ind]]%>%select(x,y,dater)%>%
+    st_as_sf(coords=c("x","y"),crs=4326)%>%st_transform(crs=2154)->sf_ind
+  ltraj=st_coordinates(sf_ind)%>%as.data.frame()%>%
+    mutate(dater=as.POSIXct(sf_ind$dater),id=ind)%>%
+    as.ltraj(date = .$dater,id = 'id',typeII = T)
+  list_ltraj_bonelli[[ind]]<-ltraj[[1]]%>%mutate(dist_nest=sqrt(R2n),day_interval=dt/86400)
+}
+
+```
+
+```{r}
+for(j in 1:length(list_ltraj_bonelli)){
+  ind<-names(list_ltraj_bonelli)[j]
+  print(ind)
+  #for each individual we calculate the distances between the nest (first location) and all the locations.
+  sf_data_ind<-list_ltraj_bonelli[[ind]] %>%  
+    st_as_sf(coords = c("x","y"),crs=2154) 
+  sf_data_ind$dist_from_nest<-
+    st_distance(sf_data_ind[1,],sf_data_ind) %>% 
+    as.vector()
+  #for eahc individuals we take the first date fulfilling the criterion.
+  duration_tracking<-nrow(sf_data_ind)
+  i=0
+  date_depart_weston<-NA
+  while((all(sf_data_ind[i:(i+10),]$dist_from_nest>5000)!=TRUE)&((i+10)<duration_tracking)){
+    date_depart_weston<-sf_data_ind[i,]$date
+    i=i+1
+  }
+  if((i+10)==duration_tracking){
+    date_depart_weston<-NA
+  }
+  list_ltraj_bonelli[[ind]]$Date_depart_weston<-date_depart_weston
+  list_ltraj_bonelli[[ind]]$duration_errat<-max(list_ltraj_bonelli[[ind]]$date)-list_ltraj_bonelli[[ind]]$Date_depart_weston
+}
+```
+
+On vérifie la cohérence des dates de départ. Crée un graphe par individu avec la date de départ en rouge.
+
+```{r}
+for(i in 1:length(list_ltraj_bonelli)){
+  print(list_ltraj_bonelli[[i]]%>%ggplot(aes(x=date,y=sqrt(R2n)/1000))+geom_line()+geom_vline(aes(xintercept = Date_depart_weston),color='red'))+scale_y_continuous(name = "Distance au nid (km)")
+}
+```
+
+# Analyse de Cox
+
+### On calcul les 3 métriques
+
+```{r}
+n_ind=length(list_ltraj_bonelli)
+metric_ind<-data.frame(Individu=names(list_ltraj_bonelli),
+                       max_dist_nest=rep(NA,n_ind),
+                       mean_dist_nest=rep(NA,n_ind),
+                       daily_mean_dist=rep(NA,n_ind),
+                       duration_errat=rep(NA,n_ind),
+                       Date_depart=rep(NA,n_ind))
+for(i in 1:nrow(metric_ind)){
+  if(is.na(list_ltraj_bonelli[[i]]$Date_depart_weston%>%unique)){
+    next
+  }
+  else{metric_ind$mean_dist_nest[i]<-mean(list_ltraj_bonelli[[i]]$dist_nest,na.rm=T)
+  metric_ind$max_dist_nest[i]<-max(list_ltraj_bonelli[[i]]$dist_nest,na.rm=T)
+  metric_ind$daily_mean_dist[i]<-mean(list_ltraj_bonelli[[i]]$dist/list_ltraj_bonelli[[i]]$day_interval,na.rm=T)}
+  metric_ind$duration_errat[i]<-unique(list_ltraj_bonelli[[i]]$duration_errat)
+  metric_ind$Date_depart[i]<-
+    as.character(unique(list_ltraj_bonelli[[i]]$Date_depart_weston))
+}
+
+```
+
+### On combine les données survies et les métriques erratisme
+
+Je crée la variable status qui indique si les données d'un individu sont censuré (=1) ou si l'individu est mort (=2). La variable time correspond au nombre de jours vivants après départ en erratisme.
+
+```{r}
+metric_ind%>%merge(data_survival)%>%
+  mutate(status=case_when(Mort=="Oui"~2,Mort=="Non"~1,is.na(Mort)~1),Date_depart=as.Date(Date_depart),Date_debut=as.Date(Date_debut,format="%d/%m/%Y"),
+         Date_fin=as.Date(Date_fin,format="%d/%m/%Y"))%>%mutate(time=as.numeric(Date_fin-Date_depart))->data_cox
+
+```
+
+On filtre les données des individus morts avant départ en erratisme
+
+```{r}
+data_cox<-data_cox%>%filter(!is.na(Date_depart))
+```
+
+Maintenant on crée des classes correspondant au quartile pour chaque métrique. Très grand voyageur, grand voyageur, moyen voyageur, petit voyageur.
+
+Pour dist_max_nid les quantiles sont , distance maximal atteintes au nids : 43km, 211km, 393km, 758km
+
+Pour distance moyenne au nid les quantiles sont : 12km, 42km, 71km, 247km
+
+Pour distance journalière moyenne les quantile sont 1km ; 10km ; 13km ; 16 km
+
+```{r}
+data_cox$max_dist_nest_class <- cut(data_cox$max_dist_nest, 
+                 breaks = quantile(data_cox$max_dist_nest, probs = seq(0, 1, 0.25), na.rm = TRUE), 
+                 include.lowest = TRUE, 
+                 labels = c("Q1", "Q2", "Q3", "Q4"))
+
+data_cox$mean_dist_nest_class <- cut(data_cox$mean_dist_nest, 
+                 breaks = quantile(data_cox$mean_dist_nest, probs = seq(0, 1, 0.25), na.rm = TRUE), 
+                 include.lowest = TRUE, 
+                 labels = c("Q1", "Q2", "Q3", "Q4"))
+data_cox$daily_mean_dist_class <- cut(data_cox$daily_mean_dist, 
+                 breaks = quantile(data_cox$daily_mean_dist, probs = seq(0, 1, 0.25), na.rm = TRUE), 
+                 include.lowest = TRUE, 
+                 labels = c("Q1", "Q2", "Q3", "Q4"))
+save(data_cox,file = here("data","data_cox.Rdata")
+```
+
+### Analyse
+
+```{r}
+fit_max_dist <- survfit(Surv(time, status) ~ max_dist_nest_class, data = data_cox)
+fit_max_dist
+ggsurvplot(fit,
+          pval = TRUE, conf.int = TRUE,
+          risk.table = TRUE, # Add risk table
+          risk.table.col = "strata", # Change risk table color by groups
+          linetype = "strata", # Change line type by groups
+          surv.median.line = "hv", # Specify median survival
+          ggtheme = theme_bw())+ggtitle(label = "Survie pour 4 classes de distance max au nid ")
+
+fit_mean_dist <- survfit(Surv(time, status) ~ mean_dist_nest_class, data = data_cox)
+fit_mean_dist
+ggsurvplot(fit,
+          pval = TRUE, conf.int = TRUE,
+          risk.table = TRUE, # Add risk table
+          risk.table.col = "strata", # Change risk table color by groups
+          linetype = "strata", # Change line type by groups
+          surv.median.line = "hv", # Specify median survival
+          ggtheme = theme_bw())+ggtitle(label = "Survie pour 4 classes de distance  moyenne au nid")
+
+fit_daily_dist <- survfit(Surv(time, status) ~ daily_mean_dist_class, data = data_cox)
+fit_daily_dist
+ggsurvplot(fit,
+          pval = TRUE, conf.int = TRUE,
+          risk.table = TRUE, # Add risk table
+          risk.table.col = "strata", # Change risk table color by groups
+          linetype = "strata", # Change line type by groups
+          surv.median.line = "hv", # Specify median survival
+          ggtheme = theme_bw())+ggtitle(label = "Survie pour 4 classes de distance journalière moyenne")
+```
+
+s
