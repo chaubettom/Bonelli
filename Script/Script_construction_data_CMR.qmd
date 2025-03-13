@@ -370,12 +370,26 @@ for(ind in unique(table$ID)){
 }
 
 
-table<-generate_CMR_table("dnest_max_life_class")
 
-table_CMR<-table%>%select(ID,Sexe,month,state)%>%arrange(by=month)%>%
+table_CMR<-generate_CMR_table("dnest_max_life_class")%>%select(ID,Sexe,month,state)%>%arrange(by=month)%>%
   mutate(month = as.integer(month))%>%# S'assurer que 'month' est un entier
   pivot_wider(names_from = month, values_from = state, names_prefix = "month_") %>%
   arrange(ID) 
-table_CMR%>%View
-write.csv(table_CMR,file=here("Output","table_dnest_max_life.csv"))
+write.csv(table_CMR,file=here("data","table_dnest_max_life.csv"))
+```
+
+Ici on peut visualiser les histoires de vie des individus
+
+```{r}
+generate_CMR_table("dnest_max_life_class")->table
+for(ind in unique(table$ID)){
+  p<-table%>%
+    filter(ID==ind)%>%
+    ggplot(aes(x=month,y=state))+geom_line()+
+    scale_y_continuous(breaks = c(0, 1, 2, 3, 4, 5, 6), 
+                         labels = c("unseen", "dist1", "dist2", "dist3", "mort", "vivant unseen", "cantonné ou date limite")) +
+    labs(title = ind)
+  
+  print(p)
+}
 ```
