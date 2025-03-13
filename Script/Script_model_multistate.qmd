@@ -34,6 +34,7 @@ library(ggspatial)
 library(htmltools)
 library(htmlwidgets)
 library(recurse)
+library(here)
 load(here("Data","list_propre_individu_jour.Rdata"))
 load(here("Data","list_segmentation_xy.Rdata"))
 data_survival <- read_excel(here("Data","data_survival.xlsx"))
@@ -349,7 +350,9 @@ generate_CMR_table<-function(metric_name){
                              debut_periode<Controle~5,
                            Mort=="Non"&debut_periode>=Date_fin&
                              debut_periode>=Controle~0,
-                           TRUE~10))%>%
+                          Mort=="Non"&debut_periode>=Date_fin&
+                             is.na(Controle)&
+                            is.na(Cantonnement)~0))%>%
     mutate(state=case_when(debut_periode>=as.Date("20-03-2023", format = "%d-%m-%Y")~6,TRUE~state))
   return(full_data_table)
 }
@@ -366,8 +369,13 @@ for(ind in unique(table$ID)){
   print(p)
 }
 
+
+table<-generate_CMR_table("dnest_max_life_class")
+
 table_CMR<-table%>%select(ID,Sexe,month,state)%>%arrange(by=month)%>%
   mutate(month = as.integer(month))%>%# S'assurer que 'month' est un entier
   pivot_wider(names_from = month, values_from = state, names_prefix = "month_") %>%
   arrange(ID) 
+table_CMR%>%View
+write.csv(table_CMR,file=here("Output","table_dnest_max_life.csv"))
 ```
