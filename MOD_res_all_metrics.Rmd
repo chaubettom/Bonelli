@@ -1,0 +1,862 @@
+---
+title: ''
+output: html_document
+date: ""
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo       = FALSE,
+                      eval       = TRUE,
+                      message    = FALSE,
+                      warning = FALSE,
+                      collapse   = TRUE,
+                      out.width  = "100%",
+                      dpi        = 300)
+library(ggplot2)
+library(nimble)
+library(nimbleEcology)
+library(tidyverse)
+library(survival)
+library(survminer)
+library(knitr) 
+library(rmarkdown) 
+library(markdown)
+library(arulesViz)
+library(devtools)
+library(adehabitatHR)
+library(adehabitatHS)
+library(adehabitatMA)
+library(adehabitatLT)
+library(ggplot2)
+#library(maptools)
+library(readxl)
+library(sf)
+library(spatstat)
+library(tidyverse)
+library(mapview)
+library(amt)
+library(dplyr)
+library(plyr)
+library(plotly)
+library(DHARMa)
+library(ggspatial)
+library(htmltools)
+library(htmlwidgets)
+library(recurse)
+library(here)
+
+rm(list=ls())
+```
+
+# SURVIE BONELLI JUV SELON METRIQUE DE DEPLACEMENT 
+
+```{r}
+################################################################################ FONCTION 
+
+######################################### construction jeu de donnée 
+generate_CMR_table<-function(metric_name){
+  full_data_table<-data_survival%>%select(ID=Individu,Sexe,Date_debut,Date_fin,Mort,Cantonnement,Controle=Contrôle)%>%merge(data_metric_all_ind)
+  full_data_table$Controle>as.Date("20-03-2021", format = "%d-%m-%Y")
+  full_data_table$Mort=="Oui"&full_data_table$debut_periode>=full_data_table$Date_fin
+  full_data_table<-full_data_table%>%
+    mutate(state=case_when(Mort=="Oui"&debut_periode>=Date_fin~4,
+                           Mort=="Oui"&
+                             debut_periode<Date_fin~get(metric_name),
+                           Mort=="NA"&debut_periode>=Date_fin~0,
+                           Mort=="NA"&
+                             debut_periode<Date_fin~get(metric_name),
+                           Mort=="Non"&
+                             debut_periode<Date_fin~get(metric_name),
+                           Mort=="Non"&debut_periode>=Date_fin&
+                             debut_periode<Cantonnement~5,
+                           Mort=="Non"&debut_periode>=Date_fin&
+                             debut_periode>=Cantonnement~6,
+                           Mort=="Non"&debut_periode>=Date_fin&
+                             debut_periode<Controle~5,
+                           Mort=="Non"&debut_periode>=Date_fin&
+                             debut_periode>=Controle~0,
+                          Mort=="Non"&debut_periode>=Date_fin&
+                             is.na(Controle)&
+                            is.na(Cantonnement)~0))%>%
+    mutate(state=case_when(debut_periode>=as.Date("20-03-2023", format = "%d-%m-%Y")~6,TRUE~state))
+  return(full_data_table)
+}
+
+######################################### CMR 
+### jeu de donnée 
+prep_data_CMR<-function(data){
+
+    data<-data[,3:69]
+    K<-ncol(data)
+
+##### CLEANAGE MATRICE 
+# On conserve uniquement les codes 1,2,3 et 4
+
+# Apres mort --> NA
+    for (i in 1:nrow(data)){
+      pos_4=which(data[i,]==4)
+      if(length(pos_4)>1){
+        for( j in pos_4[2]:K){data[i,j]<-0}
+      }}
+
+### On remplace tout les 6 et les 0 par des NA 
+    for (r in 1:nrow(data)){
+      for(c in 1:K){
+        if(data[r,c]==6){data[r,c]<-0}
+      }}
+
+### remplacement des codes 5 
+#### supression ID qui commencent pas 5
+    ID_suppr<-NULL 
+    for(i in 1:nrow(data)){
+      pos_5<-which(data[i,]==5)
+      if(min(pos_5)==1){ID_suppr=c(ID_suppr, i)}
+    }
+    data<-data[-ID_suppr,]
+
+##On ramplace tout les 5 en fin de lignes
+    for (i in 1:nrow(data)){
+      pos_5<-which(data[i,]==5)
+      pos_4<-which(data[i,]==4)
+      pos_other<-which(data[i,]==1 | data[i,]==2 | data[i,]==3)
+      
+      if(length(pos_4)==0){
+        if(length(pos_5)!=0){
+          if(min(pos_5)>max(pos_other)){data[i,pos_5]<-0}
+        }}  
+    }
+
+##On remplace tout les autres 5 par la valeur d'avant 
+    for (i in 1:nrow(data)){
+      pos_5<-which(data[i,]==5)
+      l<-length(pos_5)
+      if(l!=0){
+        for (j in 1:l){
+          data[i, pos_5[j]]<-data[i,(pos_5[j]-1)]}
+      }}
+
+### On remplace tout les 0 par NA
+    for (r in 1:nrow(data)){
+      for(c in 1:K){
+        if(data[r,c]==0){data[r,c]<-NA}
+      }
+    }
+
+return(data)}
+
+cal_last<-function(data){
+  Last<-NULL 
+for (i in 1:nrow(data)){
+  pos_data<-which(!is.na(data[i,]))
+  if(length(pos_data)!=0){
+    last_pos=max(pos_data)}
+  else{last_pos=K}
+  Last<-c(Last, last_pos)
+}
+  return(Last)
+}
+
+### CMR avec transitions impossibles
+CMR_transition_impossible<-function(data, Last, nthin, nburnin, niter, nchain){
+  
+  
+  my.code<-nimbleCode({
+    #### PRIOR 
+    for (u in 1:3){
+      surv[u]~dunif(0,1) #probabilité de survie
+    }
+    transi_12 ~ dunif(0,1)
+    transi_13 ~ dunif(0,1)
+    transi_23 ~ dunif(0,1)
+    
+    ############################################################################## OBSERVATION 
+    #       0 = non-observed
+    #       1 = seen as class 1
+    #       2 = seen as class 2
+    #       3 = seen as class 3
+    #       4 = seen as dead
+    #       5 = seen in a uncertain state
+    
+    ################################################# INIT 
+    #real state = 1 
+    po.init[1,1] <- 1       # seen 1
+    po.init[1,2] <- 0       # seen 2
+    po.init[1,3] <- 0       # seen 3
+    po.init[1,4] <- 0       # seen 4
+    
+    #real state = 2
+    po.init[2,1] <- 0       # seen 1
+    po.init[2,2] <- 1       # seen 2
+    po.init[2,3] <- 0       # seen 3
+    po.init[2,4] <- 0       # seen 4
+    
+    #real state = 3
+    po.init[3,1] <- 0       # seen 1
+    po.init[3,2] <- 0       # seen 2
+    po.init[3,3] <- 1       # seen 3
+    po.init[3,4] <- 0       # seen 4
+    
+    #real state= 4
+    po.init[4,1] <- 0       # seen 1
+    po.init[4,2] <- 0       # seen 2
+    po.init[4,3] <- 0       # seen 3
+    po.init[4,4] <- 1       # seen 4
+    
+    ################################################## Process 
+    #real state = 1
+    po[1,1] <- 1       # seen 1
+    po[1,2] <- 0       # seen 2
+    po[1,3] <- 0       # seen 3
+    po[1,4] <- 0       # seen 4
+    
+    #real state = 2
+    po[2,1] <- 0       # seen 1
+    po[2,2] <- 1       # seen 2
+    po[2,3] <- 0       # seen 3
+    po[2,4] <- 0       # seen 4
+    
+    #real state = 3
+    po[3,1] <- 0       # seen 1
+    po[3,2] <- 0       # seen 2
+    po[3,3] <- 1       # seen 3
+    po[3,4] <- 0       # seen 4
+    
+    #real state= 4
+    po[4,1] <- 0       # seen 1
+    po[4,2] <- 0       # seen 2
+    po[4,3] <- 0       # seen 3
+    po[4,4] <- 1       # seen 4
+    
+    ############################################################################## TRANSITION 
+    #       1 = class 1
+    #       2 = class 2
+    #       3 = class 3
+    #       4 = seen as dead
+    
+    # Priors
+    for(y in 1:2) {pii[y] ~ dunif(0,1)}
+    
+    ############################################################# Init
+    px0[1]<-  exp(pii[1])/(1+exp(pii[1])+exp(pii[2])) # 1 classe distance 1
+    px0[2]<-  exp(pii[2])/(1+exp(pii[1])+exp(pii[2])) # 2 classe distance 2
+    px0[3]<-  1/(1+exp(pii[1])+exp(pii[2])) # 3 classe distance 3
+    px0[4]<-  0  # 4 mort
+    
+    ############################################################# Process
+    # Classe 1 a t
+    px[1,1]<- surv[1]  #1 at t+1
+    px[1,2]<- surv[1] * transi_12 #2 at t+1
+    px[1,3]<- surv[1] * transi_13 #3 at t=1
+    px[1,4]<- (1-surv[1]) #dead at t+1
+    
+    # Classe 2 a t
+    px[2,1]<- 0 #1 at t+1
+    px[2,2]<- surv[2]  #2 at t+1
+    px[2,3]<- surv[2] * transi_23 #3 at t=1
+    px[2,4]<- (1-surv[2]) #dead at t+1
+    
+    # Classe 3 a t
+    px[3,1]<- 0 #1 at t+1
+    px[3,2]<- 0 #2 at t+1
+    px[3,3]<- surv[3]  #3 at t=1
+    px[3,4]<- (1-surv[3]) #dead at t+1
+    
+    # Classe dead a t
+    px[4,1]<- 0 #1 at t+1
+    px[4,2]<- 0 #2 at t+1
+    px[4,3]<- 0 #3 at t=1
+    px[4,4]<- 1 #dead at t+1
+    
+    ############################################################################## LIKELIHOOD 
+    for (i in 1:Nind){
+      # First capture occasion
+      z[i,1] ~ dcat(px0[1:4])
+      CH[i,1] ~ dcat(po.init[z[i,1],1:4])
+      
+      # Other years of capture events
+      for (t in 2:Last[i]) {
+        z[i,t] ~ dcat(px[z[i,t-1],1:4])
+        CH[i,t] ~ dcat(po[z[i,t],1:4])
+      }
+    }
+    
+  }) #end model
+  
+  
+  ###################################### RUN MODEL 
+  n.thin = nthin
+  n.burnin = nburnin
+  n.keep.exact = niter
+  n.keep = n.keep.exact * n.thin
+  n.iter = n.burnin + n.keep
+  n.chains = nchain
+  
+  
+  my.const = list(Nind=nrow(data),
+                  Last=Last)
+  
+  ### data en entrée
+  my.data = list(CH = data)  
+  
+  ## initialisation
+  #alive = alive_fct(data,Nind,K)
+  alive_fct<-function(data){
+    alive<-data
+    alive<-as.matrix(alive)
+    return(alive)
+  }
+  
+  my.init = list(z = alive_fct(data), 
+                 surv=runif(3,0,1), 
+                 transi_12 =runif(1,0,1), 
+                 transi_13 =runif(1,0,1), 
+                 transi_23 =runif(1,0,1))
+  
+  parameters<-c("surv", "transi_12", "transi_13", "transi_23")
+  
+  out<-nimbleMCMC(code=my.code, 
+                  constants=my.const, 
+                  data=my.data, 
+                  inits=my.init, 
+                  monitors = parameters,
+                  thin=n.thin,
+                  niter = n.iter, 
+                  nburnin = n.burnin, 
+                  nchains = n.chains , 
+                  progressBar = TRUE, 
+                  summary = TRUE)
+  
+  return(out) 
+}
+
+
+### CMR toutes transition 
+CMR_all_transition<-function(data, Last, nthin, nburnin, niter, nchain){
+
+  
+  my.code<-nimbleCode({
+    #### PRIOR 
+    for (u in 1:3){
+      surv[u]~dunif(0,1) #probabilité de survie
+    }
+    transi_12 ~ dunif(0,1)
+    transi_13 ~ dunif(0,1)
+    transi_21 ~ dunif(0,1)
+    transi_23 ~ dunif(0,1)
+    transi_31 ~ dunif(0,1)
+    transi_32 ~ dunif(0,1)
+    
+    ############################################################################## OBSERVATION 
+    #       0 = non-observed
+    #       1 = seen as class 1
+    #       2 = seen as class 2
+    #       3 = seen as class 3
+    #       4 = seen as dead
+    #       5 = seen in a uncertain state
+    
+    ################################################# INIT 
+    #real state = 1 
+    po.init[1,1] <- 1       # seen 1
+    po.init[1,2] <- 0       # seen 2
+    po.init[1,3] <- 0       # seen 3
+    po.init[1,4] <- 0       # seen 4
+    
+    #real state = 2
+    po.init[2,1] <- 0       # seen 1
+    po.init[2,2] <- 1       # seen 2
+    po.init[2,3] <- 0       # seen 3
+    po.init[2,4] <- 0       # seen 4
+    
+    #real state = 3
+    po.init[3,1] <- 0       # seen 1
+    po.init[3,2] <- 0       # seen 2
+    po.init[3,3] <- 1       # seen 3
+    po.init[3,4] <- 0       # seen 4
+    
+    #real state= 4
+    po.init[4,1] <- 0       # seen 1
+    po.init[4,2] <- 0       # seen 2
+    po.init[4,3] <- 0       # seen 3
+    po.init[4,4] <- 1       # seen 4
+    
+    ################################################## Process 
+    #real state = 1
+    po[1,1] <- 1       # seen 1
+    po[1,2] <- 0       # seen 2
+    po[1,3] <- 0       # seen 3
+    po[1,4] <- 0       # seen 4
+    
+    #real state = 2
+    po[2,1] <- 0       # seen 1
+    po[2,2] <- 1       # seen 2
+    po[2,3] <- 0       # seen 3
+    po[2,4] <- 0       # seen 4
+    
+    #real state = 3
+    po[3,1] <- 0       # seen 1
+    po[3,2] <- 0       # seen 2
+    po[3,3] <- 1       # seen 3
+    po[3,4] <- 0       # seen 4
+    
+    #real state= 4
+    po[4,1] <- 0       # seen 1
+    po[4,2] <- 0       # seen 2
+    po[4,3] <- 0       # seen 3
+    po[4,4] <- 1       # seen 4
+    
+    ############################################################################## TRANSITION 
+    #       1 = class 1
+    #       2 = class 2
+    #       3 = class 3
+    #       4 = seen as dead
+    
+    # Priors
+    for(y in 1:2) {pii[y] ~ dunif(0,1)}
+    
+    ############################################################# Init
+    px0[1]<-  exp(pii[1])/(1+exp(pii[1])+exp(pii[2])) # 1 classe distance 1
+    px0[2]<-  exp(pii[2])/(1+exp(pii[1])+exp(pii[2])) # 2 classe distance 2
+    px0[3]<-  1/(1+exp(pii[1])+exp(pii[2])) # 3 classe distance 3
+    px0[4]<-  0  # 4 mort
+    
+    ############################################################# Process
+    # Classe 1 a t
+    px[1,1]<- surv[1]  #1 at t+1
+    px[1,2]<- surv[1] * transi_12 #2 at t+1
+    px[1,3]<- surv[1] * transi_13 #3 at t=1
+    px[1,4]<- (1-surv[1]) #dead at t+1
+    
+    # Classe 2 a t
+    px[2,1]<- surv[2] * transi_21 #1 at t+1
+    px[2,2]<- surv[2]  #2 at t+1
+    px[2,3]<- surv[2] * transi_23 #3 at t=1
+    px[2,4]<- (1-surv[2]) #dead at t+1
+    
+    # Classe 3 a t
+    px[3,1]<- surv[3] * transi_31 #1 at t+1
+    px[3,2]<- surv[3] * transi_32 #2 at t+1
+    px[3,3]<- surv[3]  #3 at t=1
+    px[3,4]<- (1-surv[3]) #dead at t+1
+    
+    # Classe dead a t
+    px[4,1]<- 0 #1 at t+1
+    px[4,2]<- 0 #2 at t+1
+    px[4,3]<- 0 #3 at t=1
+    px[4,4]<- 1 #dead at t+1
+    
+    ############################################################################## LIKELIHOOD 
+    for (i in 1:Nind){
+      # First capture occasion
+      z[i,1] ~ dcat(px0[1:4])
+      CH[i,1] ~ dcat(po.init[z[i,1],1:4])
+      
+      # Other years of capture events
+      for (t in 2:Last[i]) {
+        z[i,t] ~ dcat(px[z[i,t-1],1:4])
+        CH[i,t] ~ dcat(po[z[i,t],1:4])
+      }
+    }
+    
+  }) #end model
+  
+  
+  ###################################### RUN MODEL 
+  n.thin = nthin
+  n.burnin = nburnin
+  n.keep.exact = niter
+  n.keep = n.keep.exact * n.thin
+  n.iter = n.burnin + n.keep
+  n.chains = nchain
+  
+  
+  my.const = list(Nind=nrow(data),
+                  Last=Last)
+  
+  ### data en entrée
+  my.data = list(CH = data)  
+  
+  ## initialisation
+  #alive = alive_fct(data,Nind,K)
+  alive_fct<-function(data){
+    alive<-data
+    alive<-as.matrix(alive)
+    return(alive)
+  }
+  
+  my.init = list(z = alive_fct(data), 
+                 surv=runif(3,0,1), 
+                 transi_12 =runif(1,0,1), 
+                 transi_13 =runif(1,0,1), 
+                 transi_21 =runif(1,0,1), 
+                 transi_23 =runif(1,0,1), 
+                 transi_31 =runif(1,0,1), 
+                 transi_32 =runif(1,0,1))
+  
+  parameters<-c("surv", "transi_12", "transi_13" , 
+                "transi_21", "transi_23" , "transi_31" , "transi_32")
+  
+  out<-nimbleMCMC(code=my.code, 
+                  constants=my.const, 
+                  data=my.data, 
+                  inits=my.init, 
+                  monitors = parameters,
+                  thin=n.thin,
+                  niter = n.iter, 
+                  nburnin = n.burnin, 
+                  nchains = n.chains , 
+                  progressBar = TRUE, 
+                  summary = TRUE)
+  
+ return(out) 
+}
+
+```
+
+```{r}
+#### Import et construction jeu de données distance 
+load(here::here("Data","list_propre_individu_jour.Rdata"))
+load(here::here("Data","list_segmentation_xy.Rdata"))
+data_survival <- readxl::read_excel("DATA","data_survival.xlsx")
+
+### On fait une liste qui contient les trajectoires, ainsi que les distances par jour, R2n la distance au nid au carrée, etc ...
+list_ltraj_bonelli<-list()
+for(i in 1:length(list_GPS_jour)){
+  ind=names(list_GPS_jour)[i]
+  list_GPS_jour[[ind]]%>%select(x,y,dater)%>%
+    st_as_sf(coords=c("x","y"),crs=4326)%>%st_transform(crs=2154)->sf_ind
+  ltraj=st_coordinates(sf_ind)%>%as.data.frame()%>%
+    mutate(dater=as.POSIXct(sf_ind$dater),id=ind)%>%
+    as.ltraj(date = .$dater,id = 'id',typeII = T)
+  list_ltraj_bonelli[[ind]]<-ltraj[[1]]%>%mutate(dist_nest=sqrt(R2n),day_interval=dt/86400)
+}
+
+### On détermine les dates de départ en erratisme en utilisant la méthode de Weston et al. (2013).
+for(j in 1:length(list_ltraj_bonelli)){
+  ind<-names(list_ltraj_bonelli)[j]
+  #print(ind)
+  #for each individual we calculate the distances between the nest (first location) and all the locations.
+  sf_data_ind<-list_ltraj_bonelli[[ind]] %>%  
+    st_as_sf(coords = c("x","y"),crs=2154) 
+  sf_data_ind$dist_from_nest<-
+    st_distance(sf_data_ind[1,],sf_data_ind) %>% 
+    as.vector()
+  #for eahc individuals we take the first date fulfilling the criterion.
+  duration_tracking<-nrow(sf_data_ind)
+  i=0
+  date_depart_weston<-NA
+  while((all(sf_data_ind[i:(i+10),]$dist_from_nest>5000)!=TRUE)&((i+10)<duration_tracking)){
+    date_depart_weston<-sf_data_ind[i,]$date
+    i=i+1
+  }
+  if((i+10)==duration_tracking){
+    date_depart_weston<-NA
+  }
+  list_ltraj_bonelli[[ind]]$Date_depart_weston<-date_depart_weston
+  list_ltraj_bonelli[[ind]]$duration_errat<-max(list_ltraj_bonelli[[ind]]$date)-list_ltraj_bonelli[[ind]]$Date_depart_weston
+}
+
+### On enleve les individus non parti en erratisme, on ne garde que les colonne x,y, dist (distance journalière), dist_nest (distance au nid), qu'on stocke dans une liste : list_bonelli_errat
+list_bonelli_errat<-list()
+for(ind in names(list_ltraj_bonelli)){
+  if(unique(!is.na(list_ltraj_bonelli[[ind]]$Date_depart_weston))){
+    list_bonelli_errat[[ind]]<-list_ltraj_bonelli[[ind]]%>%
+      mutate(ID=ind)%>%
+      select(ID,date,x,y,dist,dist_nest,Date_depart_weston)
+      
+  }
+}
+
+### Maintenant je cree une nouvelle liste list_metric_multistate, avec une colonne month correspondant à des périodes d'un mois (30 jours ici). Des colonnes debut periode et fin periode. Prop_day_tracked = nombre de jour suivi pendant le mois. dnest_max_life = distance maximum nid sur la vie, dnest_mean_life= distance nid moyenne sur la vie, dnest_mean_month=distance nid moyenne mois, dist_mean_life= distance moyenne sur la vie, dist_cum_life = distance cumulé sur la vie, dist_cum_month= distance cumulée sur le mois.
+max_month_tracked=0
+for(ind_traj in list_bonelli_errat){
+ max_date=ind_traj$date%>%as.Date()%>%max
+ depart_date=ind_traj$Date_depart_weston%>%
+   as.Date%>%unique
+ nbre_month_tracked=ceiling(as.numeric(difftime(max_date,depart_date))/30)
+ if(nbre_month_tracked>=max_month_tracked){
+   max_month_tracked<-nbre_month_tracked
+   #print(unique(ind_traj$ID))
+  #print(nbre_month_tracked)
+
+ }
+}
+
+### L'individu suivi le plus longtemps pendant erratisme est BA11496 avec 67 mois. Il faut mentionner que la date de fin de suivi est maximum le 20/03/2023. On va donc faire des tableaux avec 67 ligne (une par mois).
+list_metric_errat<-list()
+for(ind_traj in list_bonelli_errat){
+  ind_traj<-ind_traj%>%filter(date>=Date_depart_weston)
+  errat_metric_ind<-data.frame(month=1:67)
+  Date_depart_errat=unique(ind_traj$Date_depart_weston)
+  Fin_suivi<-max(ind_traj$date)
+  #J'ajoute les dates de debut et fin periode
+  errat_metric_ind<-errat_metric_ind%>%mutate(ID=unique(ind_traj$ID),
+                                              debut_periode=Date_depart_errat+(month-1)*days(30),
+                                              fin_periode=Date_depart_errat+month*days(30))
+  
+  #J'ajoute la proportion de jours suivi pour chaque mois
+  prop_day_tracked <- errat_metric_ind %>%
+    rowwise() %>%
+    mutate(nb_localisations = sum(ind_traj$date >= debut_periode & ind_traj$date < fin_periode)) %>%
+    ungroup()
+  errat_metric_ind$prop_day_tracked<-prop_day_tracked$nb_localisations/30
+  
+  #J'ajoute dnest_max_life
+  errat_metric_ind <- errat_metric_ind %>%
+    rowwise() %>%
+    mutate(
+      #J'ajoute dnest_max_life
+      dnest_max_life = max(ind_traj$dist_nest[ind_traj$date < fin_periode], na.rm = TRUE),
+      
+      # Moyenne de dist_nest strictement avant la date de fin de période
+      dnest_mean_life = mean(ind_traj$dist_nest[ind_traj$date < fin_periode], na.rm = TRUE),
+      
+      # Moyenne de dist_nest pendant le mois (entre debut_periode inclus et fin_periode inclus)
+      dnest_mean_month = mean(ind_traj$dist_nest[ind_traj$date >= debut_periode & ind_traj$date < fin_periode], na.rm = TRUE),
+      
+      # Moyenne de dist strictement avant la date de fin de période
+      dist_mean_life = mean(ind_traj$dist[ind_traj$date < fin_periode], 
+                            na.rm = TRUE),
+      
+      # Somme des distances parcourues strictement avant fin_periode
+      dist_cum_life = sum(ind_traj$dist[ind_traj$date < fin_periode], 
+                          na.rm = TRUE),
+      
+      # Somme des distances parcourues pendant le mois (strictement entre debut_periode et fin_periode)
+      dist_cum_month = sum(ind_traj$dist[ind_traj$date >= debut_periode & ind_traj$date < fin_periode], na.rm = TRUE)
+    ) %>%
+    ungroup()
+  list_metric_errat[[unique(ind_traj$ID)]]<-errat_metric_ind
+}
+
+### Maintenant on fait des classes pour chaques métriques.
+library(dplyr)
+
+# Fusionner toutes les données de la population en un seul dataframe
+combined_data <- bind_rows(list_metric_errat, .id = "ID")
+
+# Appliquer ntile pour diviser en 3 groupes égaux pour chaque métrique
+temporary_combined_data <- combined_data %>%filter(prop_day_tracked>=0.2)%>%
+  mutate(
+    # Classification pour dnest_max_life en 3 quantiles égaux
+    dnest_max_life_class = ntile(dnest_max_life, 3),
+    
+    # Classification pour dnest_mean_life en 3 quantiles égaux
+    dnest_mean_life_class = ntile(dnest_mean_life, 3),
+    
+    # Classification pour dnest_mean_month en 3 quantiles égaux
+    dnest_mean_month_class = ntile(dnest_mean_month, 3),
+    
+    # Classification pour dist_mean_life en 3 quantiles égaux
+    dist_mean_life_class = ntile(dist_mean_life, 3),
+    
+    # Classification pour dist_cum_life en 3 quantiles égaux
+    dist_cum_life_class = ntile(dist_cum_life, 3),
+    
+    # Classification pour dist_cum_month en 3 quantiles égaux
+    dist_cum_month_class = ntile(dist_cum_month, 3)
+  )
+#On ajoute une classe 0 quand on a moins de 20% de jours suivis dans un mois
+data_metric_all_ind<-left_join(combined_data,temporary_combined_data)%>%
+  mutate(dnest_max_life_class=case_when(prop_day_tracked<0.2~5,
+                                        TRUE~dnest_max_life_class),
+         dnest_mean_life_class=case_when(prop_day_tracked<0.2~5,
+                                        TRUE~dnest_mean_life_class),
+         dnest_mean_month_class=case_when(prop_day_tracked<0.2~5,
+                                        TRUE~dnest_mean_month_class),
+         dist_mean_life_class=case_when(prop_day_tracked<0.2~5,
+                                        TRUE~dist_mean_life_class),
+         dist_cum_life_class=case_when(prop_day_tracked<0.2~5,
+                                        TRUE~dist_cum_life_class),
+         dist_cum_month_class=case_when(prop_day_tracked<0.2~5,
+                                        TRUE~dist_cum_month_class))
+
+```
+
+
+## dnest_max_life_class 
+```{r}
+#### Construction matrice de CMR 
+
+table_CMR<-generate_CMR_table("dnest_max_life_class")%>%select(ID,Sexe,month,state)%>%arrange(by=month)%>%
+  mutate(month = as.integer(month))%>%# S'assurer que 'month' est un entier
+  pivot_wider(names_from = month, values_from = state, names_prefix = "month_") %>%
+  arrange(ID) 
+
+data_CMR<-prep_data_CMR(table_CMR)
+
+Last<-cal_last(data=data_CMR)
+
+```
+
+```{r}
+##### RUN CMR 
+### life donc transition vers classe inferieur impossible 
+out_metric<-CMR_transition_impossible(data_CMR, Last, nthin=2, nburnin=1000, niter=2000, nchain=2)
+MCMCvis::MCMCtrace(out_metric$samples, params= c("surv", "transi_12", "transi_13", "transi_23"), pdf=F, ind = TRUE)
+
+res<-MCMCvis::MCMCsummary(out_metric$samples, params = c("surv", "transi_12", "transi_13" ,  "transi_23"))
+ 
+knitr::kable(res) 
+
+```
+
+
+
+## dnest_mean_life_class
+```{r}
+#### Construction matrice de CMR 
+
+table_CMR<-generate_CMR_table("dnest_mean_life_class")%>%select(ID,Sexe,month,state)%>%arrange(by=month)%>%
+  mutate(month = as.integer(month))%>%# S'assurer que 'month' est un entier
+  pivot_wider(names_from = month, values_from = state, names_prefix = "month_") %>%
+  arrange(ID) 
+
+data_CMR<-prep_data_CMR(table_CMR)
+
+Last<-cal_last(data_CMR)
+
+```
+
+```{r}
+##### RUN CMR 
+### month donc transition vers toute classe inferieur possible
+out_metric<-CMR_all_transition(data_CMR, Last, nthin=2, nburnin=1000, niter=2000, nchain=2)
+
+MCMCvis::MCMCtrace(out_metric$samples, params= c("surv", "transi_12", "transi_13" , 
+                "transi_21", "transi_23" , "transi_31" , "transi_32"), pdf=F, ind = TRUE)
+
+res<-MCMCvis::MCMCsummary(out_metric$samples, params = c("surv", "transi_12", "transi_13" , 
+                "transi_21", "transi_23" , "transi_31" , "transi_32"))
+ 
+knitr::kable(res) 
+```
+
+
+## dnest_mean_month_class
+```{r}
+#### Construction matrice de CMR 
+
+table_CMR<-generate_CMR_table("dnest_mean_month_class")%>%select(ID,Sexe,month,state)%>%arrange(by=month)%>%
+  mutate(month = as.integer(month))%>%# S'assurer que 'month' est un entier
+  pivot_wider(names_from = month, values_from = state, names_prefix = "month_") %>%
+  arrange(ID) 
+
+data_CMR<-prep_data_CMR(table_CMR)
+
+Last<-cal_last(data_CMR)
+
+```
+
+
+```{r}
+##### RUN CMR 
+### month donc transition vers toute classe inferieur possible
+out_metric<-CMR_all_transition(data_CMR, Last, nthin=2, nburnin=1000, niter=2000, nchain=2)
+
+MCMCvis::MCMCtrace(out_metric$samples, params= c("surv", "transi_12", "transi_13" , 
+                "transi_21", "transi_23" , "transi_31" , "transi_32"), pdf=F, ind = TRUE)
+
+res<-MCMCvis::MCMCsummary(out_metric$samples, params = c("surv", "transi_12", "transi_13" , 
+                "transi_21", "transi_23" , "transi_31" , "transi_32"))
+ 
+knitr::kable(res) 
+```
+
+
+## dist_mean_life_class
+```{r}
+#### Construction matrice de CMR 
+
+table_CMR<-generate_CMR_table("dist_mean_life_class")%>%select(ID,Sexe,month,state)%>%arrange(by=month)%>%
+  mutate(month = as.integer(month))%>%# S'assurer que 'month' est un entier
+  pivot_wider(names_from = month, values_from = state, names_prefix = "month_") %>%
+  arrange(ID) 
+
+data_CMR<-prep_data_CMR(table_CMR)
+
+Last<-cal_last(data_CMR)
+
+```
+
+
+```{r}
+##### RUN CMR 
+### month donc transition vers toute classe inferieur possible
+out_metric<-CMR_all_transition(data_CMR, Last, nthin=2, nburnin=1000, niter=2000, nchain=2)
+
+MCMCvis::MCMCtrace(out_metric$samples, params= c("surv", "transi_12", "transi_13" , 
+                "transi_21", "transi_23" , "transi_31" , "transi_32"), pdf=F, ind = TRUE)
+
+res<-MCMCvis::MCMCsummary(out_metric$samples, params = c("surv", "transi_12", "transi_13" , 
+                "transi_21", "transi_23" , "transi_31" , "transi_32"))
+ 
+knitr::kable(res) 
+```
+
+
+
+## dist_cum_life_class
+```{r}
+#### Construction matrice de CMR 
+
+table_CMR<-generate_CMR_table("dist_cum_life_class")%>%select(ID,Sexe,month,state)%>%arrange(by=month)%>%
+  mutate(month = as.integer(month))%>%# S'assurer que 'month' est un entier
+  pivot_wider(names_from = month, values_from = state, names_prefix = "month_") %>%
+  arrange(ID) 
+
+data_CMR<-prep_data_CMR(table_CMR)
+
+Last<-cal_last(data_CMR)
+
+```
+
+```{r}
+##### RUN CMR 
+### life donc transition vers classe inferieur impossible 
+out_metric<-CMR_transition_impossible(data_CMR, Last, nthin=2, nburnin=1000, niter=2000, nchain=2)
+MCMCvis::MCMCtrace(out_metric$samples, params= c("surv", "transi_12", "transi_13", "transi_23"), pdf=F, ind = TRUE)
+
+res<-MCMCvis::MCMCsummary(out_metric$samples, params = c("surv", "transi_12", "transi_13" ,  "transi_23"))
+ 
+knitr::kable(res) 
+
+```
+
+
+## dist_cum_month_class
+
+```{r}
+#### Construction matrice de CMR 
+
+table_CMR<-generate_CMR_table("dist_cum_month_class")%>%select(ID,Sexe,month,state)%>%arrange(by=month)%>%
+  mutate(month = as.integer(month))%>%# S'assurer que 'month' est un entier
+  pivot_wider(names_from = month, values_from = state, names_prefix = "month_") %>%
+  arrange(ID) 
+
+data_CMR<-prep_data_CMR(table_CMR)
+
+Last<-cal_last(data_CMR)
+
+```
+
+
+```{r}
+##### RUN CMR 
+### month donc transition vers toute classe inferieur possible
+out_metric<-CMR_all_transition(data_CMR, Last, nthin=2, nburnin=1000, niter=2000, nchain=2)
+
+MCMCvis::MCMCtrace(out_metric$samples, params= c("surv", "transi_12", "transi_13" , 
+                "transi_21", "transi_23" , "transi_31" , "transi_32"), pdf=F, ind = TRUE)
+
+res<-MCMCvis::MCMCsummary(out_metric$samples, params = c("surv", "transi_12", "transi_13" , 
+                "transi_21", "transi_23" , "transi_31" , "transi_32"))
+ 
+knitr::kable(res) 
+```
+
+
+
+
+
+
+

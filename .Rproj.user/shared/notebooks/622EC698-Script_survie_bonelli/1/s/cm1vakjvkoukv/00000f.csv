@@ -1,1 +1,0 @@
-"0","data_cox<-data_cox%>%filter(!is.na(Date_depart))"
